@@ -101,6 +101,7 @@ int gettok(char **outptr) /* get token and place into tokbuf */
     return(type);
 }
 
+// 셸에서 프로그램을 실행할때 시그널 핸들링 (ex, 타이머, 실행시간이 긴 타이머 등등을 종료할때 한번에 종료되지 않고 한번 더 눌러야 종료)
 void handle_int(int signo) {
     if(!fg_pid) {
         switch (signo) {
@@ -131,6 +132,9 @@ void handle_int(int signo) {
     }
 }
 
+// homedir을 전역변수에 저장
+// 1. 환경변수
+// 2. 현재uid의 홈디렉토리
 void getHomeDir() {
     if ((homedir = getenv("HOME")) == NULL) {
         homedir = getpwuid(getuid())->pw_dir;
@@ -138,13 +142,14 @@ void getHomeDir() {
     // printf("home directory: %s\n", homedir);
 }
 
+// cd 명령
 void changeDir(char **cline) {
     char temp_curdir[MAXBUF];
     // copy current dir
     strcpy(temp_curdir, curdir);
     
     // case 1. cd (Only) => homedir
-    if(cline[1] == NULL || cline[1] == '\0') {
+    if(cline[1] == NULL || cline[1] == '\0' || strcmp(cline[1], "~/") == 0 || strcmp(cline[1], "~") == 0) {
         strcpy(temp_curdir, homedir);
     } else {
         // case 2. start with / ($ cd / || cd /var/ like)
@@ -162,7 +167,7 @@ void changeDir(char **cline) {
         }
     }
     
-    printf("to: %s\n", temp_curdir);
+    // printf("to: %s\n", temp_curdir);
     
     int nResult = chdir(temp_curdir);
     if(nResult == 0) { // 이동 성공
@@ -220,7 +225,7 @@ struct specialStruct isRedirect(char **cline, int narg) {
 
 /***
  ex) ls -l /usr/lib | grep ^d
- ex) ls ~/ grep Down
+ ex) ls ~/ | grep Down
  ***/
 void singlePipe(char *com1[], char *com2[]) {
     int p[2], status;
@@ -230,6 +235,7 @@ void singlePipe(char *com1[], char *com2[]) {
     switch(fork()) {
         case -1:
             printf("Error: fork call in singlePipe\n");
+            break;
         case 0: // 자식
             dup2(p[1], 1); /*표준 출력이 파이프로 가게함*/
             close(p[0]);
@@ -237,12 +243,89 @@ void singlePipe(char *com1[], char *com2[]) {
             execvp(com1[0], com1);
             printf("Error: 1st execvp call in singlePipe\n");
         default: // 부모
+            wait(NULL);
             dup2(p[0], 0); /* 표준 입력이 파이프로부터 오게함 */
             close(p[0]);
             close(p[1]);
             execvp(com2[0], com2); /* com2: grep */
             printf("Error: 2nd execvp call in singlePipe\n");
             printf("errno: %d", errno);
+    }
+    
+}
+
+// 3개 이상의 pipe를 다룸
+// $ ls -al | grep ^d | sort
+// *command[0], command[0]
+void multiPipe(char ***command, int userPipeNum) {
+    int i = 0;
+    pid_t pid;
+    
+    int fd1[2];
+    int fd2[2];
+    
+    pipe(fd1);
+    pipe(fd2);
+    
+    for(i=0; i < userPipeNum+1; i++) {
+        pid = fork();
+        if(pid==-1){
+            if (i != 2){
+                if (i % 2 != 0){
+                    close(fd1[1]); // for odd i
+                }else{
+                    close(fd2[1]); // for even i
+                }
+            }
+            printf("Child process could not be created\n");
+            return;
+        }
+        
+        if(pid==0){
+            // first
+            if (i == 0){
+                dup2(fd2[1], STDOUT_FILENO);
+            }
+            else if (i == userPipeNum+1 - 1){
+                if (userPipeNum+1 % 2 != 0){ // odd
+                    dup2(fd1[0],STDIN_FILENO);
+                }else{ // even
+                    dup2(fd2[0],STDIN_FILENO);
+                }
+            }else{ // odd
+                if (i % 2 != 0){
+                    dup2(fd2[0],STDIN_FILENO);
+                    dup2(fd1[1],STDOUT_FILENO);
+                }else{ // even
+                    dup2(fd1[0],STDIN_FILENO);
+                    dup2(fd2[1],STDOUT_FILENO);
+                }
+            }
+            
+            execvp(*command[i], command[i]);
+        }
+        
+        // close descriptor
+        if (i == 0){
+            close(fd2[1]);
+        }
+        else if (i == userPipeNum+1 - 1){
+            if (userPipeNum+1 % 2 != 0){
+                close(fd1[0]);
+            }else{
+                close(fd2[0]);
+            }
+        }else{
+            if (i % 2 != 0){
+                close(fd2[0]);
+                close(fd1[1]);
+            }else{
+                close(fd1[0]);
+                close(fd2[1]);
+            }
+        }
+        
+        waitpid(pid,NULL,0);
     }
 }
 
@@ -251,7 +334,7 @@ void singlePipe(char *com1[], char *com2[]) {
  ex) sort < ./tmp.txt (변경 전, tmp.log < dmesg) (left, in)
  ***/
 void singleRedirect(char *com1[], char *com2[], int isRightHand) {
-    int fd, p[2], status;
+    int fd;
     
     switch(fork()) {
         case -1:
@@ -259,11 +342,19 @@ void singleRedirect(char *com1[], char *com2[], int isRightHand) {
         case 0: // 자식
             if(isRightHand) { // ">" out
                 fd = open(com2[0] , O_WRONLY | O_CREAT | O_TRUNC, 0644);
+                if(fd < 0) {
+                    printf("file open failed\n");
+                    return;
+                }
                 dup2(fd, STDOUT_FILENO); // 표준 출력이 파일로 오게함
                 close(fd);
                 execvp(*com1, com1);
             } else { // "<" in
                 fd = open(com2[0], O_RDONLY);
+                if(fd < 0) {
+                    printf("file open failed\n");
+                    return;
+                }
                 dup2(fd, STDIN_FILENO); // 표준 입력이 파일로 오게 함
                 close(fd);
                 execvp(*com1, com1);
@@ -279,13 +370,19 @@ void singleRedirect(char *com1[], char *com2[], int isRightHand) {
     }
 }
 
+// Todo: Multi Redirect
+void multiRedirect(char *com1[], char *com2[], char *com3[]) {
+    // com 1
+    // com 2 실행결과를 1에 넣고
+}
+
 // pipe가 포함된 실행구문 실행
 void procPipe(char **cline, int narg, int *pipeIdx) {
     char *one[MAXBUF];
     char *two[MAXBUF];
     char *three[MAXBUF];
     
-    if((pipeIdx[0] != -1) && (pipeIdx[1] == -1)) {
+    if((pipeIdx[0] != -1) && (pipeIdx[1] == -1)) { // 파이프 2개이상 발견
         // case 1. single pipe
         int i=0;
         
@@ -304,10 +401,36 @@ void procPipe(char **cline, int narg, int *pipeIdx) {
         two[i2] = NULL;
         
         singlePipe(one, two);
-        
     } else if(pipeIdx[0] != -1 && pipeIdx[0] != -1) {
         // case 2. double pipe
+        // case 1. single pipe
+        int i=0;
         
+        // for one args
+        for(i=0; i<pipeIdx[0]; i++) {
+            one[i] = cline[i];
+        }
+        one[i] = NULL;
+        
+        // for two args
+        int i2=0;
+        for(i=pipeIdx[0]+1; i<pipeIdx[1]; i++) {
+            two[i2] = cline[i];
+            i2++;
+        }
+        two[i2] = NULL;
+        
+        // for three args
+        int i3=0;
+        for(i=pipeIdx[1]+1; i<narg; i++) {
+            three[i3] = cline[i];
+            i3++;
+        }
+        three[i3] = NULL;
+        
+        char **command[3] = {one, two, three};
+        
+        multiPipe(command, 2);
     
     } else {
         // printf("*cline: %s \n", *cline);
@@ -319,11 +442,10 @@ void procPipe(char **cline, int narg, int *pipeIdx) {
 }
 
 // redirect가 포함된 실행구문 실행
-void procRedirect(char **cline, int narg, int *redirectIdx) {
+void procSingleRedirect(char **cline, int narg, int *redirectIdx) {
     char *one[MAXBUF];
     char *two[MAXBUF];
     
-
     // case 1. redirect >
     int i=0;
     
@@ -341,13 +463,6 @@ void procRedirect(char **cline, int narg, int *redirectIdx) {
     }
     two[i2] = NULL;
     
-    // printf("one[0]: %s \n", one[0]);
-    // printf("one[1]: %s \n", one[1]);
-    // printf("one[1]: %s \n", one[2]);
-    // printf("two[0]: %s \n", two[0]);
-    // printf("two[1]: %s \n", two[1]);
-    
-    
     if(strcmp(cline[redirectIdx[0]], "<") == 0) {
         // case 1. redirect <, in, left
         // printf("left side\n");
@@ -359,8 +474,52 @@ void procRedirect(char **cline, int narg, int *redirectIdx) {
     } else {
         printf("redirect wrong case! \n");
     }
-    
 }
+
+// 리다이렉트 여러개, 토크나이징
+void procMultiRedirect(char **cline, int narg, int *redirectIdx) {
+    char *one[MAXBUF];
+    char *two[MAXBUF];
+    char *three[MAXBUF];
+    
+    // case 1. redirect >
+    int i=0;
+    
+    // for one args
+    for(i=0; i<redirectIdx[0]; i++) {
+        one[i] = cline[i];
+    }
+    one[i] = NULL;
+    
+    // for two args
+    int i2=0;
+    for(i=redirectIdx[0]+1; i<narg; i++) {
+        two[i2] = cline[i];
+        i2++;
+    }
+    two[i2] = NULL;
+    
+    // for two args
+    int i3=0;
+    for(i=redirectIdx[1]+1; i<narg; i++) {
+        two[i3] = cline[i];
+        i3++;
+    }
+    three[i3] = NULL;
+    
+    // support
+    if(!strcmp(cline[redirectIdx[0]], "<")) {
+        if(!strcmp(cline[redirectIdx[1]], ">")){
+            multiRedirect(one, two, three);
+        } else {
+            printf("wrong sentence. please use like ex) program < file1 > file2\n");
+        }
+    } else { // does not support
+        printf("wrong sentence. please use like ex) program < file1 > file2\n");
+    }
+}
+
+
 
 /* execute a command with optional wait */
 int runcommand(char **cline, int where, int narg)
@@ -402,31 +561,44 @@ int runcommand(char **cline, int where, int narg)
         struct specialStruct isPipeResult= isPipe(cline, narg);
         struct specialStruct isRedirectResult = isRedirect(cline, narg);
         
+        // ~/ => /homedir
+        if(narg >= 2) {
+            if(strcmp(cline[0], "cd") != 0 && (cline[1][0] == '~') && (cline[1][1] == '/')){ // not cd and start with ~/blah then replace
+                int len = (unsigned)strlen(cline[1]);
+                char position = 3, c = 0;
+                char sub[512];
+                
+                while (c < len) {
+                    sub[c] = cline[1][position+c-1];
+                    c++;
+                }
+                
+                sub[c] = '\0';
+                char temp_homedir_with_path[512] = "";
+                strcat(temp_homedir_with_path, homedir);
+                strcat(temp_homedir_with_path, "/");
+                strcat(temp_homedir_with_path, sub);
+                
+                cline[1] = temp_homedir_with_path;
+            }
+        }
         
-        if(isPipeResult.found == 1) {
-            // printf("is pipe!!!!!\n");
-            // Case 1. cline has pipe(|)
-            
+        
+        if(isPipeResult.found == 1) { // pipe 발견
             // Case 1 (1). 단일 파이프
-            
-            // printf("cline is: %s\n", *cline);
-            // printf("narg is: %d\n", narg);
-            // printf("index[0] is: %d\n", isPipeResult.index[0]);
-            // printf("index[1] is: %d\n", isPipeResult.index[1]);
-            procPipe(cline, narg, isPipeResult.index);
-            
-            
             // Case 1 (2). 복수 파이프
-            // printf("pipe founded \n");
-            
-        } else if(isRedirectResult.found == 1) {
-            // Case 2. cline has redirect(>,<)
-            procRedirect(cline, narg, isRedirectResult.index);
-            // printf("redirect founded\n");
-            
-        } else {
+            procPipe(cline, narg, isPipeResult.index);
+        } else if(isRedirectResult.found == 1) { // redirect 발견
+            // Case 2. (1) cline has redirect(>,<)
+            if(isRedirectResult.index[0] == -1 || isRedirectResult.index[1] == -1) {
+                procSingleRedirect(cline, narg, isRedirectResult.index);
+            } else { // Case 2. (2) cline has two redirect(>,<)
+                procMultiRedirect(cline, narg, isRedirectResult.index);
+            }
+        } else { // Todo: Pipe, Redirect 섞여있는 경우....
             // Case 3. Normal Case
             // printf("normal founded\n");
+            
             execvp(*cline, cline);
             perror(*cline);
         }
