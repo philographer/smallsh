@@ -7,7 +7,7 @@
 #include <pwd.h>
 #include <errno.h>
 #include <fcntl.h>
-
+#include <sys/wait.h>
 
 /* program buffers and work pointers */
 static char inpbuf[MAXBUF], tokbuf[2*MAXBUF], *ptr = inpbuf, *tok = tokbuf;
